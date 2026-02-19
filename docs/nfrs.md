@@ -2,10 +2,11 @@
 
 ## Service Scope
 
-- System: PCI tokenization and de-tokenization platform.
-- Stack: GCP + Python.
-- Topology: single region, multi-zone high availability.
-- Data class: PCI-sensitive PAN data in vault boundary.
+- System: Jack Henry central PCI tokenization and de-tokenization platform.
+- Stack: GCP + Python. Compute: GKE private cluster (VPC-native pod networking satisfies PCI DSS 1.2/1.3 without Customized Approach).
+- Topology: single region, multi-zone high availability (multi-region active-active is a Future Phase item).
+- Data class: PCI-sensitive PAN data in vault boundary, partitioned by `institution_id`.
+- Callers: Jack Henry internal application services (Banno, SilverLake, Symitar, ProfitStars) acting on behalf of bank and credit union institution clients.
 
 ## Throughput And Latency Targets
 
@@ -53,20 +54,26 @@ Notes:
 ## Concurrency Model
 
 - Concurrent active client connections target: 100,000.
-- Per-tenant fairness:
-  - Base quota: 500 RPS per tenant.
-  - Burst quota: 2,000 RPS per tenant for 60 seconds.
-- Hard ceiling:
-  - 10,000 RPS per tenant unless explicitly approved.
-  - 5,000 RPS per domain unless explicitly approved.
+- Per-institution rate limits (protects service fairness across bank/credit union clients):
+  - Base quota: 500 RPS per institution.
+  - Burst quota: 2,000 RPS per institution for 60 seconds.
+  - Hard ceiling: 10,000 RPS per institution unless explicitly approved by platform team.
+- Per-caller-application rate limits (protects against single JH product line saturation):
+  - Default: 5,000 RPS per caller application (e.g., Banno aggregate, SilverLake aggregate).
+  - Hard ceiling: requires platform team approval.
+- Rate limit buckets are institution-isolated: one institution's burst cannot consume another institution's quota.
 
 ## Security And Compliance NFRs
 
-- PAN data encrypted at rest using envelope encryption (AEAD).
-- Keys managed in Cloud KMS with HSM-backed protection for key-encryption keys.
+- PAN data encrypted at rest using AES-256-GCM envelope encryption (field-level, not disk-level).
+- Two KMS key classes per institution: PFK (HMAC-SHA-256 for fingerprinting) and PEK (AES-256-GCM for encryption). Both are institution-scoped (one per institution, provisioned at onboarding).
+- Keys managed in Cloud KMS with HSM-backed protection; 90-day rotation.
 - No PAN/CVV in logs, metrics labels, traces, or error bodies.
-- Strict authZ for de-tokenization by service identity + domain + purpose.
-- Full audit record for tokenization, de-tokenization, revocation, and failed attempts.
+- All callers authenticated via Workload Identity; no static API keys.
+- Authorization: Workload Identity validity → delegation grant for `institution_id` → domain/purpose policy → (detokenize) full-pan scope gate.
+- Full audit record for tokenization, de-tokenization, revocation, and failed attempts, with `caller_application` and `institution_id` as mandatory indexed fields.
+- Institution Registry lookup: ≤ 2ms added to request latency (in-process cached).
+- Delegation grant check: ≤ 1ms added to request latency (in-process cached).
 
 ## Operational NFRs
 
@@ -84,6 +91,8 @@ Notes:
 
 ## Validation Acceptance Criteria
 
-- Load tests show sustained 50k RPS while meeting p95/p99 SLOs.
-- Chaos/failure tests prove fail-closed behavior for de-tokenize on authZ degradation.
+- Load tests show sustained 50k RPS while meeting p95/p99 SLOs under multi-institution, multi-caller-application traffic mix.
+- Rate limiting validated: per-institution and per-caller-application quotas enforced independently.
+- Chaos/failure tests prove fail-closed behavior for de-tokenize on delegation grant service degradation — no PAN released.
 - Synthetic probes validate health/readiness every 30 seconds from at least 3 zones.
+- Institution Registry and delegation grant check latency contributions measured and within NFR budgets under load.

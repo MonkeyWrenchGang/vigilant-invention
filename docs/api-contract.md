@@ -2,16 +2,30 @@
 
 Base path: `/v1`
 
-## Authentication
+## Context: Jack Henry Internal Central Tokenization Service
 
-- Service-to-service identity via short-lived Google Cloud Workload Identity token. The resolved caller identity is used server-side; callers do not supply a `tenant_id` in the request body — it is derived from the authenticated identity.
-- Caller must be authorized for the target `domain` and any provided `scope_qualifiers`.
-- De-tokenization additionally requires explicit `detokenize` permission scoped to the caller's service identity + domain + purpose.
-- Full PAN return additionally requires the `full-pan` IAM scope granted to the caller identity. Absent this scope, detokenize always returns a masked PAN.
+This API is consumed exclusively by Jack Henry internal application services (Banno, SilverLake, Symitar, ProfitStars, and others). It is not exposed to institution clients or cardholders directly. All callers are Jack Henry-operated services running within the Jack Henry GCP organization.
 
-## Observability
+---
 
-- Optional `x-request-id` accepted and echoed in all responses.
+## Authentication And Authorization
+
+### Caller Identity
+Caller application identity is established via **Google Cloud Workload Identity**. Each Jack Henry application service has a dedicated service account (e.g., `banno-payments@jh-payments.iam.gserviceaccount.com`). No static API keys or long-lived credentials are used.
+
+### Institution Authorization (Delegation Model)
+Every request supplies an `institution_id` identifying the bank or credit union client on whose behalf the operation is being performed. The authorization policy validates that the caller application's service account is **delegated** to act for that institution. A caller supplying an unauthorized `institution_id` receives `403 FORBIDDEN` regardless of the operation.
+
+```
+Authorization check order:
+1. Is the caller's Workload Identity valid?          → 401 if not
+2. Is the caller authorized for this institution_id? → 403 if not
+3. Is the caller authorized for this domain/purpose? → 403 if not
+4. (detokenize only) Does caller hold full-pan scope? → 403 if not and FULL_PAN requested
+```
+
+### Observability
+- Optional `x-request-id` header accepted and echoed in all responses.
 - If not provided, service generates one.
 - All responses include `request_id` for distributed tracing.
 
@@ -19,16 +33,17 @@ Base path: `/v1`
 
 ## `POST /v1/tokenize`
 
-Create a domain-and-scope-scoped token for a PAN.
+Create a token for a PAN, scoped to an institution, domain, and optional scope qualifiers.
 
 ### Request
 
 ```json
 {
-  "domain": "checkout",
+  "institution_id": "inst_firstnational_001",
+  "domain": "card-payments",
   "scope_qualifiers": {
-    "merchant_id": "m_99821",
-    "application_id": "app-mobile-v2"
+    "application": "banno-mobile",
+    "channel": "web"
   },
   "token_purpose": "payment",
   "token_mode": "REUSABLE",
@@ -44,15 +59,16 @@ Create a domain-and-scope-scoped token for a PAN.
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `domain` | Yes | Business context namespace (e.g., checkout, subscription). |
-| `scope_qualifiers` | No | Key-value map of additional scope dimensions (e.g., merchant_id, application_id, channel). All keys and values must be non-PAN string identifiers. |
-| `token_purpose` | Yes | Allowed business function enum (e.g., `payment`, `refund`). |
+| `institution_id` | Yes | Jack Henry institution identifier. Caller must be authorized to act for this institution. |
+| `domain` | Yes | Business context namespace within the institution (e.g., `card-payments`, `ach`, `digital-banking`). |
+| `scope_qualifiers` | No | Key-value map for further differentiation within domain (e.g., `{"application": "banno-mobile", "channel": "web"}`). Keys and values must be non-PAN strings. |
+| `token_purpose` | Yes | Enumerated business function: `payment`, `refund`, `verification`, `provisioning`. |
 | `token_mode` | Yes | `REUSABLE` or `ONE_TIME`. |
-| `pan` | Yes | The Primary Account Number. Never logged or stored plaintext. |
+| `pan` | Yes | Primary Account Number. Never logged or stored plaintext. |
 | `exp_month` | No | Card expiry month. |
 | `exp_year` | No | Card expiry year. |
 | `ttl_seconds` | No | Token TTL override. Defaults to domain policy. |
-| `idempotency_key` | Yes | Minimum 8 characters. Scoped to caller identity. |
+| `idempotency_key` | Yes | Minimum 8 characters. Scoped to `(caller_identity, institution_id)`. |
 
 ### Response 200
 
@@ -69,32 +85,33 @@ Create a domain-and-scope-scoped token for a PAN.
 
 ### Idempotency Behavior
 
-- Idempotency scope: `(caller_identity, idempotency_key)`.
-- Repeated requests with same idempotency key return original successful result.
-- `REUSABLE` mode may also return a previously generated active token by `(caller_identity, domain, scope_qualifiers_canonical, pan_fingerprint, token_purpose)`.
-- `scope_qualifiers` are canonicalized as sorted key-value pairs for lookup consistency.
+- Idempotency scope: `(caller_identity, institution_id, idempotency_key)`.
+- Repeated requests with the same key combination return the original successful result.
+- `REUSABLE` mode additionally deduplicates by `(institution_id, domain, scope_qualifiers_canonical, token_purpose, pan_fingerprint)` — if an active token exists for that scope, it is returned with `reused_existing: true`.
+- `scope_qualifiers` are canonicalized as lexicographically sorted key-value pairs before lookup.
 
 ---
 
 ## `POST /v1/detokenize`
 
-Resolve a token to PAN for authorized callers only. Returns masked PAN by default.
+Resolve a token to PAN for authorized callers. Returns masked PAN by default.
 
 ### Request
 
 ```json
 {
-  "domain": "checkout",
+  "institution_id": "inst_firstnational_001",
+  "domain": "card-payments",
   "scope_qualifiers": {
-    "merchant_id": "m_99821",
-    "application_id": "app-mobile-v2"
+    "application": "banno-mobile",
+    "channel": "web"
   },
   "token_purpose": "payment",
   "token": "5R2eW...s8p",
   "request_context": {
     "reason_code": "REFUND_PROCESSING",
     "transaction_id": "tx_550e8400-e29b",
-    "operator_id": "user_admin_04"
+    "operator_id": "bank-employee-id-04"
   },
   "format_options": {
     "return_type": "MASKED_PAN"
@@ -106,14 +123,15 @@ Resolve a token to PAN for authorized callers only. Returns masked PAN by defaul
 
 | Field | Required | Description |
 | --- | --- | --- |
+| `institution_id` | Yes | Must match the institution under which the token was issued. |
 | `domain` | Yes | Must match the domain under which the token was issued. |
 | `scope_qualifiers` | No | Must match the scope_qualifiers under which the token was issued. |
 | `token_purpose` | Yes | Must match the purpose under which the token was issued. |
 | `token` | Yes | The token to resolve. |
-| `request_context.reason_code` | Yes | Enumerated reason for detokenization. Required for audit trail (PCI DSS 10.2.1.2). Valid values: `PAYMENT_PROCESSING`, `REFUND_PROCESSING`, `FRAUD_INVESTIGATION`, `CHARGEBACK`, `SETTLEMENT`, `COMPLIANCE_REVIEW`. |
-| `request_context.transaction_id` | No | Caller-supplied correlation ID linking this call to an originating transaction. Included in audit event. |
-| `request_context.operator_id` | No | Caller-asserted identity of the human operator or service context initiating the request. Treated as audit metadata only — not verified by the tokenization service. |
-| `format_options.return_type` | No | `MASKED_PAN` (default) or `FULL_PAN`. `FULL_PAN` requires the caller to hold the `full-pan` IAM scope; if the scope is absent the request is rejected with `403 FORBIDDEN`. |
+| `request_context.reason_code` | Yes | Required enumerated reason. Valid values: `PAYMENT_PROCESSING`, `REFUND_PROCESSING`, `FRAUD_INVESTIGATION`, `CHARGEBACK`, `SETTLEMENT`, `COMPLIANCE_REVIEW`. Requests without a valid reason code are rejected with `400`. |
+| `request_context.transaction_id` | No | Caller-supplied correlation ID to the originating transaction. Written to audit event. |
+| `request_context.operator_id` | **Required for `FULL_PAN`**; optional for `MASKED_PAN` | Caller-asserted identifier of the bank employee or institution end-user initiating the request. Required when requesting full cleartext PAN to create an attribution chain for the highest-risk operation. Treated as unverified audit metadata — written to the audit event with an `unverified` flag. |
+| `format_options.return_type` | No | `MASKED_PAN` (default) or `FULL_PAN`. `FULL_PAN` requires the caller application to hold the `full-pan` IAM scope; absent the scope, request is rejected with `403 FORBIDDEN`. `FULL_PAN` also requires `operator_id`. |
 
 ### Response 200 — Masked (default)
 
@@ -127,7 +145,7 @@ Resolve a token to PAN for authorized callers only. Returns masked PAN by defaul
 }
 ```
 
-### Response 200 — Full PAN (requires `full-pan` scope)
+### Response 200 — Full PAN (requires `full-pan` IAM scope)
 
 ```json
 {
@@ -142,41 +160,45 @@ Resolve a token to PAN for authorized callers only. Returns masked PAN by defaul
 ### Detokenize Behavior Notes
 
 - Service fails closed on any authorization uncertainty or policy service error — no fallback to allow.
-- If `scope_qualifiers` in the request do not match the token's issuance scope, the request returns `404 TOKEN_NOT_FOUND` (not a scope mismatch error, to avoid information disclosure).
-- `operator_id` is caller-asserted and written to the audit event with a marker indicating it is unverified.
+- `institution_id` or `scope_qualifiers` mismatch returns `404 TOKEN_NOT_FOUND` (same as token not found) to avoid disclosing whether a token exists under a different institution or scope.
+- `operator_id` is caller-asserted and written to the audit event with `"verified": false`. It is not authenticated by the tokenization service. It is required for `FULL_PAN` requests to ensure every cleartext PAN access has an attributed bank employee or operator identity in the audit record.
 
 ---
 
 ## `POST /v1/tokens/revoke`
 
-Revoke active tokens by token value or by scope selector.
+Revoke active tokens by token value or by institution fingerprint selector.
 
 ### Request — by token
 
 ```json
 {
-  "domain": "checkout",
+  "institution_id": "inst_firstnational_001",
+  "domain": "card-payments",
   "token": "5R2eW...s8p",
-  "reason": "merchant_request"
+  "reason": "institution_request"
 }
 ```
 
-### Request — by scope fingerprint
+### Request — by fingerprint selector
 
 ```json
 {
-  "domain": "checkout",
+  "institution_id": "inst_firstnational_001",
+  "domain": "card-payments",
   "scope_qualifiers": {
-    "merchant_id": "m_99821"
+    "application": "banno-mobile"
   },
   "pan_fingerprint": "abc123...",
-  "reason": "fraud_signal"
+  "reason": "card_reissued"
 }
 ```
 
-`scope_qualifiers` in the fingerprint revocation selector acts as a filter. Omitting it revokes all matching tokens for the fingerprint within the domain regardless of scope. Including it restricts revocation to tokens matching both domain and the provided qualifier values.
+`scope_qualifiers` in the fingerprint selector acts as a filter:
+- **Provided**: revokes only tokens matching both the domain and all supplied qualifier key-value pairs (e.g., revoke all Banno-issued tokens for this card at this institution).
+- **Omitted**: revokes all active tokens for the fingerprint within the institution and domain.
 
-**Reason codes:** `merchant_request`, `fraud_signal`, `card_compromised`, `merchant_offboarded`, `application_decommissioned`, `compliance_action`.
+**Reason codes:** `institution_request`, `fraud_signal`, `card_compromised`, `card_reissued`, `application_decommissioned`, `compliance_action`.
 
 ### Response 200
 
@@ -196,20 +218,31 @@ Uniform error body:
 ```json
 {
   "error_code": "FORBIDDEN",
-  "message": "domain not allowed for service identity",
+  "message": "caller not authorized for institution",
   "request_id": "9bc7..."
 }
 ```
 
-Status mapping:
-
 | HTTP Status | Error Code | When Used |
 | --- | --- | --- |
-| `400` | `INVALID_REQUEST` | Malformed request, missing required fields, invalid enum value |
-| `401` | `UNAUTHORIZED` | Missing or invalid caller identity token |
-| `403` | `FORBIDDEN` | Caller identity lacks required permission for domain, scope, purpose, or full-pan |
-| `404` | `TOKEN_NOT_FOUND` | Token does not exist, is revoked, or scope mismatch (unified to avoid disclosure) |
+| `400` | `INVALID_REQUEST` | Malformed request, missing required fields, invalid enum value, PAN-like value in scope_qualifiers |
+| `401` | `UNAUTHORIZED` | Missing or invalid Workload Identity token |
+| `403` | `FORBIDDEN` | Caller not authorized for institution_id, domain, purpose, or full-pan scope |
+| `404` | `TOKEN_NOT_FOUND` | Token does not exist, is revoked, or institution/scope mismatch (unified — no disclosure) |
 | `409` | `CONFLICT` | Idempotency key reuse with different parameters |
+| `429` | `RATE_LIMITED` | Per-institution or per-caller-application quota exceeded |
 | `500` | `INTERNAL_ERROR` | Unhandled service fault |
 
 Error responses never include PAN, CVV, key material, stack traces, or internal system identifiers.
+
+---
+
+## Institution Onboarding Requirements
+
+Before an institution's data can be processed:
+1. Institution-scoped PFK must be provisioned in Cloud KMS (HMAC-SHA-256, HSM-backed).
+2. Institution-scoped PEK must be provisioned in Cloud KMS (AES-256-GCM, HSM-backed). Both keys are required; no shared-PEK option.
+3. Institution `institution_id` must be registered in the Institution Registry (Spanner config table) with PFK and PEK key references.
+4. Caller application(s) must be granted delegation authorization for the institution in the grant table.
+
+Onboarding is an operational procedure; it is not automated via this API.
